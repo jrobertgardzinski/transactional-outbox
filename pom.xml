@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.jrobertgardzinski</groupId>
+    <artifactId>transactional-outbox</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <!--
+      The transactional outbox as a library (like the voting and password libs): "an event whose
+      transaction committed WILL eventually reach the broker", extracted from the two working
+      implementations the portal grew independently — microservice-memes' hardened MEME_DELETED
+      outbox and microservice-comments' simpler after-commit publication. The audit of 2026-07-26
+      named the duplication as its motif no. 2: the participant's role was copied four times and
+      every copy carried a different guarantee.
+
+      FRAMEWORK-FREE ON PURPOSE. Consumers sit on Spring Boot, Micronaut and Quarkus, so the core
+      may not drag any of them in — and it may not depend on a Kafka client either: sending is an
+      INTERFACE (Dispatch) the service implements with whatever producer it already has. The only
+      runtime dependencies are the JDK's own java.sql and slf4j-api, the logging facade every one
+      of those frameworks already binds.
+
+      The Spring wiring (current-transaction append, @Scheduled republisher, publish-after-commit)
+      lives in the sibling module infrastructure-spring-outbox — the same split as
+      adjustable-clock + infrastructure-micronaut-clock.
+    -->
+    <properties>
+        <maven.compiler.release>25</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <!-- the one runtime dependency: a logging FACADE, no binding. The library's warnings
+                 (payload canary, retention cap reached, unconfirmed sends) are what an operator
+                 debugs a stuck outbox from, so they must reach the host's log configuration. -->
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>2.0.16</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.11.4</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.qameta.allure</groupId>
+            <artifactId>allure-junit5</artifactId>
+            <version>2.29.0</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <!-- H2 in PostgreSQL mode: the library's tests run the REAL SQL the library ships,
+                 against the same dialect the portal's services run their JDBC adapters against.
+                 No service, no broker, no container needed to prove the durability promise. -->
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
+            <version>2.3.232</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <!-- a binding for the tests only, so a failing run shows the library's own warnings -->
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>2.0.16</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.5.2</version>
+                <configuration>
+                    <systemPropertyVariables>
+                        <!-- under target/, so mvn clean removes them and reports never accumulate stale runs -->
+                        <allure.results.directory>${project.build.directory}/allure-results</allure.results.directory>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
+            <!-- allure reports everywhere -->
+            <plugin>
+                <groupId>io.qameta.allure</groupId>
+                <artifactId>allure-maven</artifactId>
+                <version>2.17.0</version>
+            </plugin>
+        </plugins>
+    </build>
+</project>

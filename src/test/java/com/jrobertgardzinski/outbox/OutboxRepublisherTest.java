@@ -1,0 +1,206 @@
+package com.jrobertgardzinski.outbox;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.time.Duration;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * The pass that makes the library's promise true, end to end: a committed event whose send failed is
+ * delivered later — the SAME event, byte for byte — and a delivered one is eventually forgotten.
+ *
+ * <p>This is the file that would fail if the extraction had eaten a property, so it asserts the
+ * durability claim rather than the shape of the code: what the broker received, what the table looks
+ * like afterwards, and in which order the two legs of a pass ran.
+ */
+class OutboxRepublisherTest {
+
+    private static final Duration RETENTION = Duration.ofHours(24);
+
+    private OutboxTestDatabase database;
+    private SteerableClock clock;
+    private TransactionalOutbox outbox;
+    private FakeDispatch broker;
+    private OutboxPublisher publisher;
+    private OutboxRepublisher republisher;
+
+    @BeforeEach
+    void freshOutbox() {
+        database = new OutboxTestDatabase("meme_events_outbox");
+        clock = SteerableClock.at("2026-07-26T10:00:00Z");
+        outbox = new TransactionalOutbox(database.table(), database.connections(), clock);
+        broker = new FakeDispatch(FakeDispatch.Behaviour.CONFIRM);
+        publisher = new OutboxPublisher(outbox, broker);
+        republisher = new OutboxRepublisher(outbox, publisher,
+                // patience shortened from the 5s default: these tests answer instantly or not at all,
+                // and a timeout case must not cost the suite five seconds
+                new RepublisherSettings(Duration.ofSeconds(30), Duration.ofMillis(200), RETENTION,
+                        500, 4, 500));
+    }
+
+    private OutboxEvent announce(String id, String key) throws SQLException {
+        OutboxEvent event = new OutboxEvent(id, "memes-events", "MEME_DELETED", key, "cid-" + key,
+                "{\"type\":\"MEME_DELETED\",\"memeId\":\"" + key + "\",\"eventId\":\"" + id + "\"}");
+        try (Connection tx = database.openTransaction()) {
+            outbox.append(tx, event);
+            tx.commit();
+        }
+        publisher.publishWithoutWaiting(event);
+        return event;
+    }
+
+    @Test
+    @DisplayName("(d) a committed event whose send failed is re-sent later — the SAME event — and marked once confirmed")
+    void the_republisher_delivers_what_the_first_attempt_could_not() throws SQLException {
+        broker.behave(FakeDispatch.Behaviour.REJECT);
+        OutboxEvent announced = announce("e-1", "orphan-thread");
+        assertFalse(database.published("e-1"), "the failed send must leave the row owed");
+        OutboxEvent firstAttempt = broker.lastHanded();
+
+        // the broker comes back; the row comes of age; the republisher takes over
+        broker.behave(FakeDispatch.Behaviour.CONFIRM);
+        clock.advance(Duration.ofMinutes(1));
+
+        OutboxRepublisher.Pass pass = republisher.runOnce();
+
+        assertEquals(new OutboxRepublisher.Pass(0, 1, 1), pass);
+        assertEquals(2, broker.sends());
+        assertEquals(firstAttempt.payload(), broker.lastHanded().payload(),
+                "the redelivery must be the SAME event — same payload, same event id inside it, so a"
+                        + " consumer can recognise the duplicate");
+        assertEquals(announced.cid(), broker.lastHanded().cid(),
+                "…and the same correlation id, rebuilt from the row rather than from an empty"
+                        + " scheduler-thread context");
+        assertTrue(database.published("e-1"), "a confirmed redelivery must mark the row");
+
+        assertEquals(new OutboxRepublisher.Pass(0, 0, 0), republisher.runOnce());
+        assertEquals(2, broker.sends(), "delivered means done — no third send");
+    }
+
+    @Test
+    @DisplayName("(d) a fresh unpublished row is left alone — its first attempt may still be in flight")
+    void the_republisher_leaves_fresh_rows_to_the_first_attempt() throws SQLException {
+        broker.behave(FakeDispatch.Behaviour.REJECT);
+        announce("e-2", "just-now");
+
+        republisher.runOnce();   // no clock advance: the row is seconds old
+
+        assertEquals(1, broker.sends(), "re-sending now would race an attempt that may still land");
+        assertFalse(database.published("e-2"));
+    }
+
+    @Test
+    @DisplayName("(d) a happy-path event is published exactly once — the republisher does not double a marked row")
+    void a_delivered_event_is_never_re_sent() throws SQLException {
+        announce("e-3", "gone");
+        assertTrue(database.published("e-3"));
+
+        clock.advance(Duration.ofMinutes(1));   // old enough to qualify, but already delivered
+        republisher.runOnce();
+
+        assertEquals(1, broker.sends());
+    }
+
+    @Test
+    @DisplayName("(d) a re-send the broker never answers costs one pass, not the event")
+    void an_unanswered_re_send_leaves_the_row_for_the_next_pass() throws SQLException {
+        broker.behave(FakeDispatch.Behaviour.REJECT);
+        announce("e-4", "stranded");
+        broker.behave(FakeDispatch.Behaviour.SILENT);
+        clock.advance(Duration.ofMinutes(1));
+
+        assertEquals(new OutboxRepublisher.Pass(0, 1, 0), republisher.runOnce(),
+                "one attempt, nothing confirmed");
+        assertFalse(database.published("e-4"));
+
+        broker.behave(FakeDispatch.Behaviour.CONFIRM);
+        assertEquals(new OutboxRepublisher.Pass(0, 1, 1), republisher.runOnce());
+        assertTrue(database.published("e-4"), "the next pass delivers it");
+    }
+
+    @Test
+    @DisplayName("(e) the pass reaps delivered rows past retention and does not touch the undelivered")
+    void a_pass_reaps_delivered_rows_only() throws SQLException {
+        announce("done-old", "delivered-long-ago");
+        announce("done-new", "delivered-just-now");
+        broker.behave(FakeDispatch.Behaviour.REJECT);
+        announce("owed-old", "still-owed");
+        database.backdateBySeconds("delivered-long-ago", Duration.ofHours(25).toSeconds());
+        database.backdateBySeconds("still-owed", Duration.ofHours(25).toSeconds());
+
+        OutboxRepublisher.Pass pass = republisher.runOnce();
+
+        assertEquals(1, pass.reaped());
+        assertEquals(1, pass.resent(), "the aged unpublished row is retried in the same pass");
+        assertEquals(0, database.count("id = ?", "done-old"));
+        assertEquals(1, database.count("id = ?", "done-new"),
+                "retention must not touch a delivered row younger than the window");
+        assertEquals(1, database.count("id = ?", "owed-old"),
+                "an undelivered row is never reaped, however old");
+    }
+
+    @Test
+    @DisplayName("(e) retention runs BEFORE the re-send, so a row this pass marks survives until the next one")
+    void retention_runs_before_the_re_send() throws SQLException {
+        // The order is a guarantee, not a preference: reaping after sending would put the reap and
+        // the mark in the same breath, and a retention window misconfigured to near-zero would then
+        // delete the row of an event whose confirmation is still in flight. Proven by looking at the
+        // table from INSIDE the send: if retention already ran, the aged delivered row is gone.
+        announce("done-old", "delivered-long-ago");
+        broker.behave(FakeDispatch.Behaviour.REJECT);
+        announce("owed-old", "still-owed");
+        database.backdateBySeconds("delivered-long-ago", Duration.ofHours(25).toSeconds());
+        database.backdateBySeconds("still-owed", Duration.ofHours(25).toSeconds());
+        broker.behave(FakeDispatch.Behaviour.CONFIRM);
+        AtomicInteger rowsWhenTheBrokerSawIt = new AtomicInteger(-1);
+        broker.onSend(event -> rowsWhenTheBrokerSawIt.set(database.rows()));
+
+        republisher.runOnce();
+
+        assertEquals(1, rowsWhenTheBrokerSawIt.get(),
+                "by the time the pass re-sends, retention has already reaped the aged delivered row"
+                        + " — only the row being re-sent is left");
+    }
+
+    @Test
+    @DisplayName("(d) the re-send leg is capped per pass, so a long outage drains over several passes")
+    void the_re_send_leg_is_capped_per_pass() throws SQLException {
+        OutboxRepublisher capped = new OutboxRepublisher(outbox, publisher,
+                new RepublisherSettings(Duration.ofSeconds(30), Duration.ofMillis(200), RETENTION,
+                        500, 4, /* resendBatchRows */ 3));
+        broker.behave(FakeDispatch.Behaviour.REJECT);
+        try (Connection tx = database.openTransaction()) {
+            for (int i = 0; i < 8; i++) {
+                outbox.append(tx, new OutboxEvent("backlog-" + i, "memes-events", "MEME_DELETED",
+                        "backlog", null, "{}"));
+            }
+            tx.commit();
+        }
+        clock.advance(Duration.ofMinutes(1));
+        broker.behave(FakeDispatch.Behaviour.CONFIRM);
+
+        assertEquals(3, capped.runOnce().resent());
+        assertEquals(3, capped.runOnce().resent());
+        assertEquals(2, capped.runOnce().resent(), "the tail of the backlog");
+        assertEquals(0, capped.runOnce().resent());
+        assertEquals(0, database.count("published = FALSE"));
+    }
+
+    @Test
+    @DisplayName("a pass never throws — a scheduler that cancels a failing task would retire the guarantee")
+    void a_broken_pass_is_swallowed_so_the_schedule_survives() {
+        // Spring's fixedDelay scheduler abandons a task whose invocation threw. A database hiccup
+        // must therefore cost one pass, not the process's whole durability mechanism.
+        database.run("DROP TABLE " + database.table().name());
+
+        assertEquals(new OutboxRepublisher.Pass(0, 0, 0), republisher.runOnce());
+    }
+}
