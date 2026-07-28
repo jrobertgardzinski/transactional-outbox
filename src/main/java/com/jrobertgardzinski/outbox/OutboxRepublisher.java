@@ -79,23 +79,36 @@ public final class OutboxRepublisher {
             int confirmed = 0;
             int poisoned = 0;
             for (OutboxEvent event : overdue) {
-                if (publisher.publishAndWait(event, settings.confirmationPatience())) {
+                OutboxPublisher.Attempt outcome =
+                        publisher.publishAndWait(event, settings.confirmationPatience());
+                if (outcome == OutboxPublisher.Attempt.CONFIRMED) {
                     confirmed++;
                     continue;
                 }
-                // The row keeps its obligation, but it also keeps a memory now: one more attempt and
-                // a backoff before the next. Without this an undeliverable event was retried every
-                // interval for ever AND, because the poll is oldest-first, it stood at the head of
-                // the queue — enough of them and no newer event was ever selected again.
+                if (outcome == OutboxPublisher.Attempt.TIMED_OUT) {
+                    // The broker said nothing — which is what an outage looks like, and says nothing
+                    // about this event. Counting it towards the ceiling meant a weekend-long outage
+                    // permanently removed the oldest backlog from the poll. Hold the row back, do
+                    // not hold it against it.
+                    outbox.deferRetry(event.id(), settings.backoffBase());
+                    continue;
+                }
+                // REJECTED: the broker ANSWERED, and its answer was no. That is about this event —
+                // a payload past the message limit, a missing topic, an ACL — so it counts. Without
+                // this an undeliverable event was retried every interval for ever AND, because the
+                // poll is oldest-first, it stood at the head of the queue.
                 int attempts = outbox.recordFailedAttempt(event.id(), settings.backoffBase(),
                         settings.backoffCap());
                 if (attempts >= settings.poisonAfter()) {
                     poisoned++;
+                    // NOT the payload. A USER_CONTENT_PURGED body carries the e-mail of the person
+                    // whose data is being erased, and both participants promise in writing that
+                    // "the logs, which have no retention anyone controls, still never see it".
+                    // The row is right there, unpublished, and the id finds it.
                     LOG.error("event {} ({} for {}) has failed {} times and will NOT be retried again"
-                                    + " — it stays in {} unpublished, and a human has to decide what"
-                                    + " to do with it. Payload: {}",
-                            event.id(), event.type(), event.key(), attempts, outbox.table().name(),
-                            event.payload());
+                                    + " — it stays in {} unpublished, under that id, and a human has"
+                                    + " to decide what to do with it",
+                            event.id(), event.type(), event.key(), attempts, outbox.table().name());
                 }
             }
             return new Pass(marked, reaped, overdue.size(), confirmed, poisoned);

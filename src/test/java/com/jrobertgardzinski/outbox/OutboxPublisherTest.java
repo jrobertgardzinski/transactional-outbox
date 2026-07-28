@@ -117,7 +117,8 @@ class OutboxPublisherTest {
     @Test
     @DisplayName("(d) publishAndWait waits for the acknowledgement, then marks — the republisher's leg is delivered-first")
     void the_waiting_attempt_marks_after_the_acknowledgement() throws SQLException {
-        assertTrue(publisher.publishAndWait(committed("e-5"), Duration.ofSeconds(5)));
+        assertEquals(OutboxPublisher.Attempt.CONFIRMED,
+                publisher.publishAndWait(committed("e-5"), Duration.ofSeconds(5)));
 
         assertTrue(database.published("e-5"));
     }
@@ -127,7 +128,10 @@ class OutboxPublisherTest {
     void the_waiting_attempt_times_out_without_marking() throws SQLException {
         broker.behave(FakeDispatch.Behaviour.SILENT);
 
-        assertFalse(publisher.publishAndWait(committed("e-6"), Duration.ofMillis(50)),
+        // TIMED_OUT, not merely "not confirmed": a silence is about the BROKER, and the caller must
+        // be able to tell it from a refusal, or an outage counts every row towards being given up on
+        assertEquals(OutboxPublisher.Attempt.TIMED_OUT,
+                publisher.publishAndWait(committed("e-6"), Duration.ofMillis(50)),
                 "a silence is 'still owed', reported as such rather than thrown");
 
         assertFalse(database.published("e-6"));
@@ -138,7 +142,9 @@ class OutboxPublisherTest {
     void the_waiting_attempt_reports_a_rejection() throws SQLException {
         broker.behave(FakeDispatch.Behaviour.REJECT);
 
-        assertFalse(publisher.publishAndWait(committed("e-7"), Duration.ofSeconds(5)));
+        // REJECTED: the broker ANSWERED, and its answer was no — that is about this event
+        assertEquals(OutboxPublisher.Attempt.REJECTED,
+                publisher.publishAndWait(committed("e-7"), Duration.ofSeconds(5)));
 
         assertFalse(database.published("e-7"));
     }

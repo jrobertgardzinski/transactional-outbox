@@ -119,6 +119,22 @@ public final class OutboxPublisher {
     }
 
     /**
+     * How an attempt ended, and the distinction matters more than it looks.
+     *
+     * <p>{@link #REJECTED} is about THIS event: a payload past the broker's message limit, a topic
+     * that does not exist, an ACL refusal. Trying it again will fail again, so it should count
+     * towards giving up. {@link #TIMED_OUT} is about the BROKER: it said nothing within the
+     * patience window, which is what an outage looks like and says nothing at all about the event.
+     *
+     * <p>Collapsing the two into one boolean meant a long outage counted every row towards the
+     * poison ceiling. Twenty-five rounds of backoff is about eighteen hours, so a broker down over
+     * a weekend permanently removed the oldest part of the backlog from the poll — the library's
+     * one promise, "will eventually reach the broker", quietly broken by the very mechanism added
+     * to protect it, with no way back except a hand-written UPDATE.
+     */
+    public enum Attempt { CONFIRMED, TIMED_OUT, REJECTED }
+
+    /**
      * The REPUBLISHER'S delivery attempt: send, WAIT for the confirmation up to {@code patience},
      * and only then mark the row published. Delivered-first — the guarantee lives here.
      *
@@ -127,10 +143,11 @@ public final class OutboxPublisher {
      * headers, different topic, a fix applied to one and not the other). The blocking is the
      * library's, not the service's.
      *
-     * @return whether the broker confirmed. A {@code false} is not an error to escalate — it means
-     *         "still owed", and the row is untouched for the next pass.
+     * @return how the attempt ended. Anything other than {@link Attempt#CONFIRMED} means "still
+     *         owed", and the row is untouched for the next pass — but see {@link Attempt} for why
+     *         the caller must not treat the two failures alike.
      */
-    public boolean publishAndWait(OutboxEvent event, Duration patience) {
+    public Attempt publishAndWait(OutboxEvent event, Duration patience) {
         // null completion = confirmed; a non-null one carries the failure. One future, so the
         // outcome can only be observed once even if a misbehaving Dispatch reports twice.
         CompletableFuture<Throwable> settled = new CompletableFuture<>();
@@ -148,9 +165,11 @@ public final class OutboxPublisher {
                 }
             });
         } catch (RuntimeException sendRefused) {
+            // the producer refused it outright (closed, buffer full, serialisation) — about the
+            // event or about this instance, not about the broker's availability
             LOG.error("event {} ({} for {}) could not be handed to the producer on re-send — it stays"
                     + " in the outbox", event.id(), event.type(), event.key(), sendRefused);
-            return false;
+            return Attempt.REJECTED;
         }
 
         Throwable failure;
@@ -160,22 +179,22 @@ public final class OutboxPublisher {
             Thread.currentThread().interrupt();
             LOG.error("interrupted before event {} ({} for {}) was confirmed — it stays in the outbox",
                     event.id(), event.type(), event.key(), interrupted);
-            return false;
+            return Attempt.TIMED_OUT;   // a shutdown says nothing about the event
         } catch (Exception notConfirmed) {
             // TimeoutException or an ExecutionException from the outcome's own completion: either
             // way the broker did not say yes within the patience, so the row keeps its obligation.
             LOG.error("event {} ({} for {}) was not confirmed by the broker within {} — it stays in"
                             + " the outbox, the next pass retries",
                     event.id(), event.type(), event.key(), patience, notConfirmed);
-            return false;
+            return Attempt.TIMED_OUT;
         }
         if (failure != null) {
             LOG.error("event {} ({} for {}) was rejected by the broker — it stays in the outbox,"
                     + " the next pass retries", event.id(), event.type(), event.key(), failure);
-            return false;
+            return Attempt.REJECTED;   // the broker ANSWERED, and its answer was no
         }
         markDelivered(event);
-        return true;
+        return Attempt.CONFIRMED;
     }
 
     /**

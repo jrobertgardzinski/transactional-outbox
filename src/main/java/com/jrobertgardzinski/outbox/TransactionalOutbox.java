@@ -58,6 +58,7 @@ public final class TransactionalOutbox {
     private final String selectPendingSql;
     private final String deletePublishedSql;
     private final String recordFailureSql;
+    private final String deferRetrySql;
     private final String readAttemptsSql;
 
     /**
@@ -87,6 +88,7 @@ public final class TransactionalOutbox {
                 + " AND attempts < ? ORDER BY created_at, id LIMIT ?";
         this.recordFailureSql = "UPDATE " + name
                 + " SET attempts = attempts + 1, next_attempt_at = ? WHERE id = ?";
+        this.deferRetrySql = "UPDATE " + name + " SET next_attempt_at = ? WHERE id = ?";
         this.readAttemptsSql = "SELECT attempts FROM " + name + " WHERE id = ?";
         // The IN (SELECT ... LIMIT n) shape is the portable one: PostgreSQL rejects LIMIT on DELETE
         // itself but allows it in a subquery, and H2 in PostgreSQL mode (what the tests and the
@@ -189,6 +191,31 @@ public final class TransactionalOutbox {
         } catch (SQLException failed) {
             throw new OutboxException("could not mark event " + eventId + " published in "
                     + table.name(), failed);
+        }
+    }
+
+    /**
+     * Holds this row back for a while WITHOUT counting the attempt against it.
+     *
+     * <p>For the case where the broker never answered. A timeout says nothing about the event, so
+     * letting it accumulate towards the poison ceiling turned an outage into permanent data loss:
+     * twenty-five rounds of backoff is about eighteen hours, and a broker down for a weekend
+     * removed the oldest part of the backlog from the poll for good.
+     *
+     * <p>The delay is flat rather than exponential, deliberately. Exponential backoff exists to get
+     * a hopeless row off the head of an oldest-first batch; a row waiting out an outage is not
+     * hopeless, and every row is equally affected, so there is no head to clear. What this does is
+     * stop a pass from spinning on the same rows within one interval — nothing more.
+     */
+    public void deferRetry(String eventId, Duration delay) {
+        try (Connection connection = connections.get();
+             PreparedStatement defer = connection.prepareStatement(deferRetrySql)) {
+            defer.setTimestamp(1, Timestamp.from(clock.instant().plus(delay)));
+            defer.setString(2, eventId);
+            defer.executeUpdate();
+        } catch (SQLException failed) {
+            // the row stays unpublished either way; the worst case is one more attempt next pass
+            LOG.warn("could not defer the retry of event {} in {}", eventId, table.name(), failed);
         }
     }
 

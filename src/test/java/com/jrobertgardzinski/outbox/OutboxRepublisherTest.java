@@ -140,6 +140,56 @@ class OutboxRepublisherTest {
     }
 
     @Test
+    @DisplayName("(d) a broker outage never poisons a row, however long it lasts")
+    void a_silent_broker_does_not_count_against_the_event() throws SQLException {
+        // The distinction this asserts is the difference between an outage and data loss. A silent
+        // broker used to count towards poisonAfter exactly like a rejection, and 25 rounds of
+        // backoff is about eighteen hours — so a broker down over a weekend permanently removed the
+        // oldest part of the backlog from the poll, breaking the library's one promise with no way
+        // back except a hand-written UPDATE.
+        broker.behave(FakeDispatch.Behaviour.REJECT);
+        announce("outage-1", "stranded");
+        broker.behave(FakeDispatch.Behaviour.SILENT);
+
+        for (int pass = 0; pass < 40; pass++) {          // far past poisonAfter = 25
+            clock.advance(Duration.ofMinutes(2));        // past any backoff this could have set
+            republisher.runOnce();
+        }
+
+        broker.behave(FakeDispatch.Behaviour.CONFIRM);
+        clock.advance(Duration.ofMinutes(2));
+        OutboxRepublisher.Pass recovery = republisher.runOnce();
+
+        assertEquals(1, recovery.resent(),
+                "after forty silent passes the row must STILL be eligible — a broker that says"
+                        + " nothing says nothing about the event");
+        assertEquals(1, recovery.confirmed());
+        assertTrue(database.published("outage-1"), "and it goes out the moment the broker returns");
+    }
+
+    @Test
+    @DisplayName("(d) a broker that ANSWERS no still poisons the row — that part must not regress")
+    void a_rejecting_broker_still_reaches_the_ceiling() throws SQLException {
+        broker.behave(FakeDispatch.Behaviour.REJECT);
+        announce("poison-1", "undeliverable");
+
+        OutboxRepublisher.Pass poisoning = null;
+        for (int pass = 0; pass < 30; pass++) {
+            clock.advance(Duration.ofHours(2));          // past the 1 h backoff cap
+            OutboxRepublisher.Pass result = republisher.runOnce();
+            if (result.poisoned() > 0) {
+                poisoning = result;
+                break;
+            }
+        }
+
+        assertTrue(poisoning != null, "a row the broker keeps REFUSING must eventually be given up on");
+        clock.advance(Duration.ofHours(2));
+        assertEquals(0, republisher.runOnce().resent(),
+                "and once poisoned it stops occupying the head of an oldest-first batch");
+    }
+
+    @Test
     @DisplayName("(e) the pass reaps delivered rows past retention and does not touch the undelivered")
     void a_pass_reaps_delivered_rows_only() throws SQLException {
         announce("done-old", "delivered-long-ago");
