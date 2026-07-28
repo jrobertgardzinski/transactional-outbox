@@ -67,11 +67,24 @@ public final class OutboxTable {
      *       as {@code varchar}, so the cliff costs nothing to remove. The canary that used to be
      *       that column limit survives as a log line (see
      *       {@link TransactionalOutbox#EXPECTED_MAX_PAYLOAD_CHARS}).</li>
-     *   <li>{@code published boolean}, not a {@code published_at} timestamp. The mark is a fact
-     *       about delivery, and the only question ever asked of it is "is this row still owed?".
-     *       A nullable timestamp would invite a second, drifting answer to that question.</li>
-     *   <li>The index is on {@code (published, created_at)} because that is the republisher's only
-     *       predicate, on both legs: "unpublished and older than" and "published and older than".
+     *   <li>{@code published_at timestamp null}, and this REPLACED a plain {@code published boolean}
+     *       on 2026-07-28. The boolean answered "is this row still owed?" perfectly well — NULL
+     *       answers it identically — but it could not answer "when did we send it?", and retention
+     *       therefore measured its window from {@code created_at}. A row that lay unpublished longer
+     *       than the retention window (a broker outage over a day, or a poisoned row that finally
+     *       went through) was already older than the window the instant it was delivered, so the
+     *       very next pass deleted it. Exactly after a mass outage, when "what did we really send,
+     *       and when?" is the most valuable question in the building, the forensic trail lived for
+     *       one interval instead of a day.</li>
+     *   <li>{@code attempts} and {@code next_attempt_at}: an event that can never be sent (a payload
+     *       past the broker's {@code max.request.size}, a deleted topic, an ACL error) used to be
+     *       retried every interval forever, and — worse — it sat at the HEAD of an
+     *       {@code ORDER BY created_at} batch. Enough of them and no newer row was ever selected
+     *       again: the "will eventually reach the broker" promise died silently, with a green test
+     *       suite. The backoff moves poison off the head of the queue; the attempt count eventually
+     *       takes it out of the poll entirely.</li>
+     *   <li>The index is on {@code (published_at, created_at)} because that is the republisher's
+     *       only predicate, on both legs: "unsent and older than" and "sent and older than".
      *       Without it the poll is a table scan every few seconds, forever.</li>
      * </ul>
      */
@@ -84,19 +97,21 @@ public final class OutboxTable {
                 -- whatever stayed unpublished. The row's id IS the event id inside the payload,
                 -- so a redelivery is a recognisable duplicate rather than a second event.
                 create table %1$s (
-                    id         varchar(36) primary key,  -- also the payload's event id
-                    topic      varchar(64) not null,
-                    event_type varchar(64) not null,
-                    event_key  varchar(64) not null,     -- partition key
-                    cid        varchar(64),              -- correlation id, stamped at announce time
-                    payload    text        not null,
-                    created_at timestamp   not null,
-                    published  boolean     not null default false
+                    id              varchar(36) primary key,  -- also the payload's event id
+                    topic           varchar(64) not null,
+                    event_type      varchar(64) not null,
+                    event_key       varchar(64) not null,     -- partition key
+                    cid             varchar(64),              -- correlation id, stamped at announce
+                    payload         text        not null,
+                    created_at      timestamp   not null,
+                    published_at    timestamp,                -- NULL = still owed
+                    attempts        int         not null default 0,
+                    next_attempt_at timestamp                 -- NULL = eligible now
                 );
 
-                -- the republisher polls "unpublished and old enough" every few seconds, and reaps
-                -- "published and old enough" in the same pass — keep both off a table scan
-                create index idx_%1$s_pending on %1$s (published, created_at);
+                -- the republisher polls "unsent and old enough" every few seconds, and reaps
+                -- "sent and old enough" in the same pass — keep both off a table scan
+                create index idx_%1$s_pending on %1$s (published_at, created_at);
                 """.formatted(name);
     }
 

@@ -71,23 +71,32 @@ class OutboxDialsTest {
     void the_settings_record_validates_every_dial() {
         Duration ok = Duration.ofSeconds(30);
         assertTrue(assertThrows(IllegalArgumentException.class,
-                () -> new RepublisherSettings(Duration.ZERO, ok, ok, 500, 4, 500))
+                () -> new RepublisherSettings(Duration.ZERO, ok, ok, 500, 4, 500, ok, ok, 25))
                 .getMessage().contains("minAge"));
         assertTrue(assertThrows(IllegalArgumentException.class,
-                () -> new RepublisherSettings(ok, Duration.ZERO, ok, 500, 4, 500))
+                () -> new RepublisherSettings(ok, Duration.ZERO, ok, 500, 4, 500, ok, ok, 25))
                 .getMessage().contains("confirmationPatience"));
         assertTrue(assertThrows(IllegalArgumentException.class,
-                () -> new RepublisherSettings(ok, ok, Duration.ZERO, 500, 4, 500))
+                () -> new RepublisherSettings(ok, ok, Duration.ZERO, 500, 4, 500, ok, ok, 25))
                 .getMessage().contains("retention"));
         assertTrue(assertThrows(IllegalArgumentException.class,
-                () -> new RepublisherSettings(ok, ok, ok, 0, 4, 500))
+                () -> new RepublisherSettings(ok, ok, ok, 0, 4, 500, ok, ok, 25))
                 .getMessage().contains("retentionBatchRows"));
         assertTrue(assertThrows(IllegalArgumentException.class,
-                () -> new RepublisherSettings(ok, ok, ok, 500, 0, 500))
+                () -> new RepublisherSettings(ok, ok, ok, 500, 0, 500, ok, ok, 25))
                 .getMessage().contains("retentionBatchesPerPass"));
         assertTrue(assertThrows(IllegalArgumentException.class,
-                () -> new RepublisherSettings(ok, ok, ok, 500, 4, 0))
+                () -> new RepublisherSettings(ok, ok, ok, 500, 4, 0, ok, ok, 25))
                 .getMessage().contains("resendBatchRows"));
+        assertTrue(assertThrows(IllegalArgumentException.class,
+                () -> new RepublisherSettings(ok, ok, ok, 500, 4, 500, Duration.ZERO, ok, 25))
+                .getMessage().contains("backoffBase"));
+        assertTrue(assertThrows(IllegalArgumentException.class,
+                () -> new RepublisherSettings(ok, ok, ok, 500, 4, 500, ok, Duration.ZERO, 25))
+                .getMessage().contains("backoffCap"));
+        assertTrue(assertThrows(IllegalArgumentException.class,
+                () -> new RepublisherSettings(ok, ok, ok, 500, 4, 500, ok, ok, 0))
+                .getMessage().contains("poisonAfter"));
     }
 
     @Test
@@ -95,11 +104,18 @@ class OutboxDialsTest {
     void the_defaults_are_the_hardened_ones() {
         RepublisherSettings defaults = RepublisherSettings.defaults(Duration.ofHours(24));
 
-        assertEquals(Duration.ofSeconds(30), defaults.minAge());
+        // 60s, not the 30s this shipped with: both services run a 30s delivery.timeout.ms, and the
+        // age clock starts at created_at — stamped INSIDE the announcing transaction, before the
+        // first attempt can even begin. At 30s the margin was zero minus the transaction's duration,
+        // so the republisher routinely sent a second copy while the first sat in the accumulator.
+        assertEquals(Duration.ofSeconds(60), defaults.minAge());
         assertEquals(Duration.ofSeconds(5), defaults.confirmationPatience());
         assertEquals(Duration.ofHours(24), defaults.retention());
         assertEquals(500, defaults.retentionBatchRows());
         assertEquals(4, defaults.retentionBatchesPerPass());
         assertEquals(500, defaults.resendBatchRows());
+        assertEquals(Duration.ofSeconds(30), defaults.backoffBase());
+        assertEquals(Duration.ofHours(1), defaults.backoffCap());
+        assertEquals(25, defaults.poisonAfter());
     }
 }

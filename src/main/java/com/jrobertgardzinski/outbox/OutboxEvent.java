@@ -26,8 +26,16 @@ import java.util.UUID;
  * @param topic   destination the {@link Dispatch} sends to (the library never guesses it)
  * @param type    event type, stored for operators reading the table and for the payload canary's
  *                log line — the library itself does not route on it
- * @param key     partition key: everything about one aggregate stays on one partition, so a
- *                consumer never sees a later hop of a cascade before an earlier one
+ * @param key     partition key: everything about one aggregate lands on one partition, so the
+ *                broker preserves the order in which events were SENT.
+ *                <p><strong>That is not the order in which they were announced, and this used to
+ *                claim otherwise.</strong> Two legs deliver: the best-effort first attempt and the
+ *                republisher. If E1's first attempt fails and E2's succeeds two seconds later, E2
+ *                reaches the partition immediately and E1 only after {@code minAge}, from the
+ *                republisher — so a consumer sees the later hop first. Estate events carry no
+ *                version field, so a consumer cannot repair it either. Ordering per aggregate is
+ *                therefore a strong tendency, not a guarantee; anything that truly depends on it
+ *                has to be idempotent and commutative, which every consumer here already is.
  * @param cid     correlation id captured at announce time, or {@code null}. STORED rather than
  *                read from a thread-local at send time — see {@link Dispatch}.
  * @param payload the bytes to deliver, opaque to this library

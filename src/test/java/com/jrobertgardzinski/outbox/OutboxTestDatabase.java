@@ -75,8 +75,10 @@ final class OutboxTestDatabase {
     }
 
     boolean published(String eventId) {
-        return queryOne("SELECT published FROM " + table.name() + " WHERE id = ?",
-                new Object[]{eventId}, rs -> rs.getBoolean(1));
+        // published_at replaced a boolean on 2026-07-28 so retention could measure its window from
+        // the DELIVERY rather than from the creation; NULL still means "owed", exactly as FALSE did
+        return queryOne("SELECT published_at FROM " + table.name() + " WHERE id = ?",
+                new Object[]{eventId}, rs -> rs.getTimestamp(1) != null);
     }
 
     String payload(String eventId) {
@@ -89,13 +91,22 @@ final class OutboxTestDatabase {
                 new Object[]{eventId}, rs -> rs.getString(1));
     }
 
-    /** Ages rows by shifting {@code created_at} back — the tests' alternative to sleeping. */
+    /**
+     * Ages rows — the tests' alternative to sleeping.
+     *
+     * <p>Shifts {@code published_at} as well as {@code created_at}, because retention measures its
+     * window from the delivery. Moving only the creation would age a row for the RE-SEND leg while
+     * leaving it forever fresh for the reaper, which is a state the production code cannot produce
+     * and would make these tests prove the wrong thing.
+     */
     void backdateBySeconds(String eventKey, long seconds) {
         try (Connection connection = DriverManager.getConnection(url);
              PreparedStatement update = connection.prepareStatement("UPDATE " + table.name()
-                     + " SET created_at = DATEADD('SECOND', ?, created_at) WHERE event_key = ?")) {
+                     + " SET created_at = DATEADD('SECOND', ?, created_at),"
+                     + " published_at = DATEADD('SECOND', ?, published_at) WHERE event_key = ?")) {
             update.setLong(1, -seconds);
-            update.setString(2, eventKey);
+            update.setLong(2, -seconds);
+            update.setString(3, eventKey);
             update.executeUpdate();
         } catch (SQLException failed) {
             throw new IllegalStateException("could not backdate " + eventKey, failed);

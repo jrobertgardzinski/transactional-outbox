@@ -130,7 +130,7 @@ class TransactionalOutboxTest {
         assertEquals("cid-of-the-delete", database.cid("traced"));
 
         clock.advance(Duration.ofHours(3));
-        OutboxEvent rebuilt = outbox.pendingOlderThan(Duration.ofSeconds(30), 10).getFirst();
+        OutboxEvent rebuilt = outbox.pendingOlderThan(Duration.ofSeconds(30), 10, 25).getFirst();
 
         assertEquals("cid-of-the-delete", rebuilt.cid(),
                 "the re-sent event must carry the trace of the request that announced it, not the"
@@ -165,7 +165,7 @@ class TransactionalOutboxTest {
         database.backdateBySeconds("old-owed", 60);
         database.backdateBySeconds("old-done", 60);
 
-        List<OutboxEvent> pending = outbox.pendingOlderThan(Duration.ofSeconds(30), 10);
+        List<OutboxEvent> pending = outbox.pendingOlderThan(Duration.ofSeconds(30), 10, 25);
 
         assertEquals(List.of("old-owed"), pending.stream().map(OutboxEvent::id).toList(),
                 "a published row is done; a fresh one may still have an attempt in flight");
@@ -182,8 +182,8 @@ class TransactionalOutboxTest {
         }
         database.backdateBySeconds("backlog", 60);
 
-        assertEquals(10, outbox.pendingOlderThan(Duration.ofSeconds(30), 10).size());
-        assertEquals(25, outbox.pendingOlderThan(Duration.ofSeconds(30), 500).size(),
+        assertEquals(10, outbox.pendingOlderThan(Duration.ofSeconds(30), 10, 25).size());
+        assertEquals(25, outbox.pendingOlderThan(Duration.ofSeconds(30), 500, 25).size(),
                 "the cap is a cap, not a page — a smaller backlog comes back whole");
     }
 
@@ -251,5 +251,78 @@ class TransactionalOutboxTest {
         assertTrue(assertThrows(IllegalArgumentException.class,
                 () -> outbox.deletePublishedOlderThan(Duration.ofHours(24), 500, -1))
                 .getMessage().contains("batches per pass"));
+    }
+
+    @Test
+    @DisplayName("(f) a row that keeps failing backs off, so it stops holding the head of the queue")
+    void a_failing_row_backs_off_exponentially() throws SQLException {
+        try (Connection tx = database.openTransaction()) {
+            outbox.append(tx, event("poison", "undeliverable"));
+            tx.commit();
+        }
+        database.backdateBySeconds("undeliverable", 120);
+        Duration base = Duration.ofSeconds(30);
+        Duration cap = Duration.ofHours(1);
+
+        assertEquals(1, outbox.recordFailedAttempt("poison", base, cap));
+        assertEquals(List.of(), outbox.pendingOlderThan(Duration.ofSeconds(30), 10, 25),
+                "a row that just failed waits out its backoff instead of being retried immediately");
+
+        clock.advance(Duration.ofSeconds(31));
+        assertEquals(1, outbox.pendingOlderThan(Duration.ofSeconds(30), 10, 25).size());
+
+        // second failure doubles it: 60s, so 31 more seconds are no longer enough
+        assertEquals(2, outbox.recordFailedAttempt("poison", base, cap));
+        clock.advance(Duration.ofSeconds(31));
+        assertEquals(List.of(), outbox.pendingOlderThan(Duration.ofSeconds(30), 10, 25));
+        clock.advance(Duration.ofSeconds(31));
+        assertEquals(1, outbox.pendingOlderThan(Duration.ofSeconds(30), 10, 25).size());
+    }
+
+    @Test
+    @DisplayName("(f) past the attempt ceiling the row drops out of the poll — and never blocks a newer one")
+    void poison_leaves_the_poll_and_stops_starving_the_queue() throws SQLException {
+        try (Connection tx = database.openTransaction()) {
+            outbox.append(tx, event("poison", "undeliverable"));
+            tx.commit();
+        }
+        database.backdateBySeconds("undeliverable", 120);
+        for (int attempt = 0; attempt < 3; attempt++) {
+            outbox.recordFailedAttempt("poison", Duration.ofMillis(1), Duration.ofMillis(1));
+        }
+
+        // This is the failure the whole mechanism exists for: with an oldest-first poll and a cap of
+        // one row, an undeliverable event at the head made every later event unreachable for ever.
+        try (Connection tx = database.openTransaction()) {
+            outbox.append(tx, event("newer", "healthy"));
+            tx.commit();
+        }
+        database.backdateBySeconds("healthy", 120);
+
+        List<OutboxEvent> pending = outbox.pendingOlderThan(Duration.ofSeconds(30), 1, 3);
+
+        assertEquals(List.of("newer"), pending.stream().map(OutboxEvent::id).toList(),
+                "the poisoned row must step aside so a deliverable event can be selected");
+        assertEquals(1, database.count("id = ?", "poison"),
+                "stepping aside is not deletion — the row stays, unpublished, for a human to judge");
+    }
+
+    @Test
+    @DisplayName("(f) retention counts from the DELIVERY, so a long-stuck event still leaves a trail")
+    void retention_measures_from_delivery_not_creation() throws SQLException {
+        try (Connection tx = database.openTransaction()) {
+            outbox.append(tx, event("stuck", "outage"));
+            tx.commit();
+        }
+        // a broker outage far longer than the retention window: created two days ago, sent just now
+        database.backdateBySeconds("outage", Duration.ofHours(48).toSeconds());
+        outbox.markPublished("stuck");
+
+        int reaped = outbox.deletePublishedOlderThan(Duration.ofHours(24), 500, 4);
+
+        assertEquals(0, reaped, "measured from created_at this row was past the window the instant it"
+                + " was delivered, and the very next pass deleted the record of the send — exactly"
+                + " after the outage that makes 'what did we send, and when?' worth asking");
+        assertEquals(1, database.count("id = ?", "stuck"));
     }
 }

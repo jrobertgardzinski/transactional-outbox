@@ -24,8 +24,8 @@ public final class OutboxRepublisher {
     private static final Logger LOG = LoggerFactory.getLogger(OutboxRepublisher.class);
 
     /** What one pass did — returned so a test can assert on the pass rather than on the log. */
-    public record Pass(int reaped, int resent, int confirmed) {
-        static final Pass NOTHING = new Pass(0, 0, 0);
+    public record Pass(int marked, int reaped, int resent, int confirmed, int poisoned) {
+        static final Pass NOTHING = new Pass(0, 0, 0, 0, 0);
     }
 
     private final TransactionalOutbox outbox;
@@ -57,6 +57,11 @@ public final class OutboxRepublisher {
      */
     public Pass runOnce() {
         try {
+            // First: the marks the producer's I/O thread was not allowed to write itself. This runs
+            // before retention on purpose — a row confirmed seconds ago gets its published_at now,
+            // and since retention measures from published_at it cannot be reaped for a whole window.
+            int marked = publisher.drainConfirmations();
+
             int reaped = outbox.deletePublishedOlderThan(settings.retention(),
                     settings.retentionBatchRows(), settings.retentionBatchesPerPass());
             if (reaped > 0) {
@@ -65,19 +70,35 @@ public final class OutboxRepublisher {
             }
 
             List<OutboxEvent> overdue = outbox.pendingOlderThan(settings.minAge(),
-                    settings.resendBatchRows());
+                    settings.resendBatchRows(), settings.poisonAfter());
             if (overdue.isEmpty()) {
-                return new Pass(reaped, 0, 0);
+                return new Pass(marked, reaped, 0, 0, 0);
             }
             LOG.warn("re-sending {} unconfirmed event(s) from {}", overdue.size(),
                     outbox.table().name());
             int confirmed = 0;
+            int poisoned = 0;
             for (OutboxEvent event : overdue) {
                 if (publisher.publishAndWait(event, settings.confirmationPatience())) {
                     confirmed++;
+                    continue;
+                }
+                // The row keeps its obligation, but it also keeps a memory now: one more attempt and
+                // a backoff before the next. Without this an undeliverable event was retried every
+                // interval for ever AND, because the poll is oldest-first, it stood at the head of
+                // the queue — enough of them and no newer event was ever selected again.
+                int attempts = outbox.recordFailedAttempt(event.id(), settings.backoffBase(),
+                        settings.backoffCap());
+                if (attempts >= settings.poisonAfter()) {
+                    poisoned++;
+                    LOG.error("event {} ({} for {}) has failed {} times and will NOT be retried again"
+                                    + " — it stays in {} unpublished, and a human has to decide what"
+                                    + " to do with it. Payload: {}",
+                            event.id(), event.type(), event.key(), attempts, outbox.table().name(),
+                            event.payload());
                 }
             }
-            return new Pass(reaped, overdue.size(), confirmed);
+            return new Pass(marked, reaped, overdue.size(), confirmed, poisoned);
         } catch (RuntimeException passFailed) {
             // Deliberately swallowed: most schedulers stop invoking a task whose run threw, which
             // would silently retire the durability mechanism after one bad database moment.

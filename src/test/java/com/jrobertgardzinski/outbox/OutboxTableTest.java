@@ -58,11 +58,18 @@ class OutboxTableTest {
 
         assertTrue(ddl.contains("create table comment_events_outbox ("));
         assertTrue(ddl.contains("create index idx_comment_events_outbox_pending"
-                        + " on comment_events_outbox (published, created_at)"),
+                        + " on comment_events_outbox (published_at, created_at)"),
                 "two outboxes may share a schema, so the index name must be per-table too:\n" + ddl);
-        assertTrue(ddl.contains("payload    text"),
+        assertTrue(ddl.contains("payload         text"),
                 "text, not varchar(n): a richer event type must not fail the INSERT inside the"
                         + " business transaction:\n" + ddl);
+        assertTrue(ddl.contains("published_at    timestamp"),
+                "a timestamp, not a boolean: retention measures its forensic window from the"
+                        + " DELIVERY, and from created_at it deleted the trail of anything that had"
+                        + " been stuck — exactly the trail worth keeping:\n" + ddl);
+        assertTrue(ddl.contains("attempts        int") && ddl.contains("next_attempt_at timestamp"),
+                "without a backoff an undeliverable row sits at the head of an oldest-first batch"
+                        + " for ever, and newer events are never selected again:\n" + ddl);
     }
 
     // That the DDL is not merely well-formed but actually CREATES a table the library's queries

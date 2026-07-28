@@ -43,7 +43,7 @@ class OutboxRepublisherTest {
                 // patience shortened from the 5s default: these tests answer instantly or not at all,
                 // and a timeout case must not cost the suite five seconds
                 new RepublisherSettings(Duration.ofSeconds(30), Duration.ofMillis(200), RETENTION,
-                        500, 4, 500));
+                        500, 4, 500, Duration.ofSeconds(30), Duration.ofHours(1), 25));
     }
 
     private OutboxEvent announce(String id, String key) throws SQLException {
@@ -54,6 +54,11 @@ class OutboxRepublisherTest {
             tx.commit();
         }
         publisher.publishWithoutWaiting(event);
+        // A confirmation no longer writes its own mark — it queues, and the republisher's pass
+        // writes it, because the callback runs on the producer's I/O thread and the mark is JDBC.
+        // Draining here is what a real pass does moments later; without it these tests would set up
+        // a state production never reaches (confirmed, permanently unmarked).
+        publisher.drainConfirmations();
         return event;
     }
 
@@ -71,7 +76,7 @@ class OutboxRepublisherTest {
 
         OutboxRepublisher.Pass pass = republisher.runOnce();
 
-        assertEquals(new OutboxRepublisher.Pass(0, 1, 1), pass);
+        assertEquals(new OutboxRepublisher.Pass(0, 0, 1, 1, 0), pass);
         assertEquals(2, broker.sends());
         assertEquals(firstAttempt.payload(), broker.lastHanded().payload(),
                 "the redelivery must be the SAME event — same payload, same event id inside it, so a"
@@ -81,7 +86,7 @@ class OutboxRepublisherTest {
                         + " scheduler-thread context");
         assertTrue(database.published("e-1"), "a confirmed redelivery must mark the row");
 
-        assertEquals(new OutboxRepublisher.Pass(0, 0, 0), republisher.runOnce());
+        assertEquals(new OutboxRepublisher.Pass(0, 0, 0, 0, 0), republisher.runOnce());
         assertEquals(2, broker.sends(), "delivered means done — no third send");
     }
 
@@ -117,13 +122,21 @@ class OutboxRepublisherTest {
         broker.behave(FakeDispatch.Behaviour.SILENT);
         clock.advance(Duration.ofMinutes(1));
 
-        assertEquals(new OutboxRepublisher.Pass(0, 1, 0), republisher.runOnce(),
+        assertEquals(new OutboxRepublisher.Pass(0, 0, 1, 0, 0), republisher.runOnce(),
                 "one attempt, nothing confirmed");
         assertFalse(database.published("e-4"));
 
         broker.behave(FakeDispatch.Behaviour.CONFIRM);
-        assertEquals(new OutboxRepublisher.Pass(0, 1, 1), republisher.runOnce());
-        assertTrue(database.published("e-4"), "the next pass delivers it");
+        // The failed attempt above bought the row a backoff, so the IMMEDIATE next pass leaves it
+        // alone — that is the whole mechanism that stops an undeliverable event from occupying the
+        // head of an oldest-first batch for ever. Prove it, then wait it out.
+        assertEquals(new OutboxRepublisher.Pass(0, 0, 0, 0, 0), republisher.runOnce(),
+                "a row that just failed is not eligible again until its backoff elapses");
+
+        clock.advance(Duration.ofMinutes(1));   // past the 30s first backoff
+
+        assertEquals(new OutboxRepublisher.Pass(0, 0, 1, 1, 0), republisher.runOnce());
+        assertTrue(database.published("e-4"), "the next eligible pass delivers it");
     }
 
     @Test
@@ -175,7 +188,8 @@ class OutboxRepublisherTest {
     void the_re_send_leg_is_capped_per_pass() throws SQLException {
         OutboxRepublisher capped = new OutboxRepublisher(outbox, publisher,
                 new RepublisherSettings(Duration.ofSeconds(30), Duration.ofMillis(200), RETENTION,
-                        500, 4, /* resendBatchRows */ 3));
+                        500, 4, /* resendBatchRows */ 3,
+                        Duration.ofSeconds(30), Duration.ofHours(1), 25));
         broker.behave(FakeDispatch.Behaviour.REJECT);
         try (Connection tx = database.openTransaction()) {
             for (int i = 0; i < 8; i++) {
@@ -191,7 +205,7 @@ class OutboxRepublisherTest {
         assertEquals(3, capped.runOnce().resent());
         assertEquals(2, capped.runOnce().resent(), "the tail of the backlog");
         assertEquals(0, capped.runOnce().resent());
-        assertEquals(0, database.count("published = FALSE"));
+        assertEquals(0, database.count("published_at IS NULL"));
     }
 
     @Test
@@ -201,6 +215,6 @@ class OutboxRepublisherTest {
         // must therefore cost one pass, not the process's whole durability mechanism.
         database.run("DROP TABLE " + database.table().name());
 
-        assertEquals(new OutboxRepublisher.Pass(0, 0, 0), republisher.runOnce());
+        assertEquals(new OutboxRepublisher.Pass(0, 0, 0, 0, 0), republisher.runOnce());
     }
 }

@@ -57,6 +57,8 @@ public final class TransactionalOutbox {
     private final String markPublishedSql;
     private final String selectPendingSql;
     private final String deletePublishedSql;
+    private final String recordFailureSql;
+    private final String readAttemptsSql;
 
     /**
      * @param table       which table (and therefore which SQL) this outbox works on
@@ -73,17 +75,47 @@ public final class TransactionalOutbox {
         this.clock = clock;
         String name = table.name();
         this.insertSql = "INSERT INTO " + name
-                + " (id, topic, event_type, event_key, cid, payload, created_at, published)"
-                + " VALUES (?, ?, ?, ?, ?, ?, ?, FALSE)";
-        this.markPublishedSql = "UPDATE " + name + " SET published = TRUE WHERE id = ?";
-        this.selectPendingSql = "SELECT id, topic, event_type, event_key, cid, payload FROM " + name
-                + " WHERE published = FALSE AND created_at <= ? ORDER BY created_at, id LIMIT ?";
+                + " (id, topic, event_type, event_key, cid, payload, created_at)"
+                + " VALUES (?, ?, ?, ?, ?, ?, ?)";
+        this.markPublishedSql = "UPDATE " + name + " SET published_at = ? WHERE id = ?";
+        // Three predicates, and the last two are why poison no longer wedges the queue: a row that
+        // just failed is not eligible until its backoff elapses (so it stops occupying the head of
+        // an oldest-first batch), and a row that has failed too many times is not eligible at all.
+        this.selectPendingSql = "SELECT id, topic, event_type, event_key, cid, payload, attempts FROM "
+                + name + " WHERE published_at IS NULL AND created_at <= ?"
+                + " AND (next_attempt_at IS NULL OR next_attempt_at <= ?)"
+                + " AND attempts < ? ORDER BY created_at, id LIMIT ?";
+        this.recordFailureSql = "UPDATE " + name
+                + " SET attempts = attempts + 1, next_attempt_at = ? WHERE id = ?";
+        this.readAttemptsSql = "SELECT attempts FROM " + name + " WHERE id = ?";
         // The IN (SELECT ... LIMIT n) shape is the portable one: PostgreSQL rejects LIMIT on DELETE
         // itself but allows it in a subquery, and H2 in PostgreSQL mode (what the tests and the
         // services' dev profile run) accepts the identical statement — one SQL string for both.
+        //
+        // The cutoff is on published_at, NOT created_at: the window this reaper implements is "a day
+        // after we SENT it", and measuring from creation deleted the trail of anything that had been
+        // stuck — which is precisely the trail worth keeping.
         this.deletePublishedSql = "DELETE FROM " + name + " WHERE id IN ("
-                + " SELECT id FROM " + name + " WHERE published = TRUE AND created_at <= ?"
-                + " ORDER BY created_at, id LIMIT ?)";
+                + " SELECT id FROM " + name + " WHERE published_at IS NOT NULL AND published_at <= ?"
+                + " ORDER BY published_at, id LIMIT ?)";
+    }
+
+    /**
+     * How long a row waits after its {@code n}-th consecutive failure: exponential from
+     * {@code base}, doubling, never past {@code cap}.
+     *
+     * <p>The point is not politeness towards the broker — it is that a permanently undeliverable row
+     * must not keep the head of an oldest-first batch. Without a backoff, {@code resendBatchRows}
+     * poisoned rows are enough to make every later event unreachable for ever.
+     */
+    static Duration backoffAfter(int attempts, Duration base, Duration cap) {
+        if (attempts <= 0) {
+            return Duration.ZERO;
+        }
+        // shift rather than Math.pow, and clamped at 30 so the doubling cannot overflow a long
+        long multiplier = 1L << Math.min(attempts - 1, 30);
+        Duration backoff = base.multipliedBy(multiplier);
+        return backoff.compareTo(cap) > 0 ? cap : backoff;
     }
 
     public OutboxTable table() {
@@ -151,11 +183,50 @@ public final class TransactionalOutbox {
     public void markPublished(String eventId) {
         try (Connection connection = connections.get();
              PreparedStatement mark = connection.prepareStatement(markPublishedSql)) {
-            mark.setString(1, eventId);
+            mark.setTimestamp(1, Timestamp.from(clock.instant()));
+            mark.setString(2, eventId);
             mark.executeUpdate();
         } catch (SQLException failed) {
             throw new OutboxException("could not mark event " + eventId + " published in "
                     + table.name(), failed);
+        }
+    }
+
+    /**
+     * Records that an attempt on this row failed: one more attempt, and not eligible again until the
+     * backoff elapses.
+     *
+     * <p>Returns the new attempt count, so the caller can tell a hiccup from poison. The read and the
+     * update run on one connection but are deliberately NOT one statement — computing an exponential
+     * backoff in SQL is a different expression on every database this library is expected to run on,
+     * and this path is rare (it only executes when a send has already failed) and always on the
+     * scheduler thread, where a second round trip costs nobody anything.
+     */
+    public int recordFailedAttempt(String eventId, Duration backoffBase, Duration backoffCap) {
+        try (Connection connection = connections.get()) {
+            int attempts;
+            try (PreparedStatement read = connection.prepareStatement(readAttemptsSql)) {
+                read.setString(1, eventId);
+                try (ResultSet row = read.executeQuery()) {
+                    if (!row.next()) {
+                        return 0;      // reaped or never existed: nothing to hold against it
+                    }
+                    attempts = row.getInt("attempts") + 1;
+                }
+            }
+            try (PreparedStatement record = connection.prepareStatement(recordFailureSql)) {
+                record.setTimestamp(1, Timestamp.from(
+                        clock.instant().plus(backoffAfter(attempts, backoffBase, backoffCap))));
+                record.setString(2, eventId);
+                record.executeUpdate();
+            }
+            return attempts;
+        } catch (SQLException failed) {
+            // a failure to record a failure must not abort the pass: the row stays unpublished, so
+            // the worst case is the old behaviour — it is retried on the next pass without backoff
+            LOG.warn("could not record the failed attempt on event {} in {}", eventId, table.name(),
+                    failed);
+            return 0;
         }
     }
 
@@ -170,13 +241,16 @@ public final class TransactionalOutbox {
      *              while retention waits behind it. A capped pass drains a backlog over several
      *              passes; steady state never reaches the cap.
      */
-    public List<OutboxEvent> pendingOlderThan(Duration minAge, int limit) {
+    public List<OutboxEvent> pendingOlderThan(Duration minAge, int limit, int poisonAfter) {
+        Timestamp now = Timestamp.from(clock.instant());
         Timestamp cutoff = Timestamp.from(clock.instant().minus(minAge));
         List<OutboxEvent> pending = new ArrayList<>();
         try (Connection connection = connections.get();
              PreparedStatement select = connection.prepareStatement(selectPendingSql)) {
             select.setTimestamp(1, cutoff);
-            select.setInt(2, limit);
+            select.setTimestamp(2, now);
+            select.setInt(3, poisonAfter);
+            select.setInt(4, limit);
             try (ResultSet rows = select.executeQuery()) {
                 while (rows.next()) {
                     pending.add(new OutboxEvent(

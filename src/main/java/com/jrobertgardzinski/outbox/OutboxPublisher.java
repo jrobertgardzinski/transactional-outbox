@@ -4,7 +4,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
+import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -32,9 +34,49 @@ public final class OutboxPublisher {
     private final TransactionalOutbox outbox;
     private final Dispatch dispatch;
 
+    /**
+     * Ids confirmed on the producer's own I/O thread, waiting to be marked by someone who is allowed
+     * to block.
+     *
+     * <p>The mark used to run right there in the callback, and that callback is the Kafka producer's
+     * single sender thread. {@code connections.get()} on a pool with nothing free blocks — Hikari's
+     * default is thirty seconds — so a database under strain froze ALL of the service's Kafka I/O:
+     * unrelated sends hit their own delivery timeout, which created more unpublished outbox rows,
+     * which needed more marking. A database problem was promoted into a Kafka availability problem,
+     * with a feedback loop, at exactly the moment the database was already suffering.
+     *
+     * <p>Unbounded on purpose: what accumulates here is bounded by throughput times the republisher's
+     * interval (seconds), and the failure mode of dropping an id is a guaranteed duplicate later,
+     * which is strictly worse than holding a string.
+     */
+    private final Queue<String> confirmedAwaitingMark = new ConcurrentLinkedQueue<>();
+
     public OutboxPublisher(TransactionalOutbox outbox, Dispatch dispatch) {
         this.outbox = outbox;
         this.dispatch = dispatch;
+    }
+
+    /**
+     * Marks everything the producer confirmed since the last call. Driven by the republisher's pass,
+     * i.e. on the scheduler thread, where blocking on a connection harms nothing.
+     *
+     * @return how many rows were marked
+     */
+    public int drainConfirmations() {
+        int marked = 0;
+        for (String eventId = confirmedAwaitingMark.poll(); eventId != null;
+             eventId = confirmedAwaitingMark.poll()) {
+            try {
+                outbox.markPublished(eventId);
+                marked++;
+            } catch (RuntimeException markFailed) {
+                // delivered but unmarked: the republisher re-sends a duplicate later, which every
+                // consumer in this estate already has to absorb from at-least-once semantics
+                LOG.warn("event {} WAS delivered but could not be marked published — the republisher"
+                        + " may re-send a harmless duplicate", eventId, markFailed);
+            }
+        }
+        return marked;
     }
 
     /**
@@ -55,7 +97,9 @@ public final class OutboxPublisher {
             dispatch.send(event, new DispatchOutcome() {
                 @Override
                 public void confirmed() {
-                    markDelivered(event);
+                    // NOT outbox.markPublished: this runs on the producer's I/O thread and the mark
+                    // is JDBC. See confirmedAwaitingMark for what that used to cost.
+                    confirmedAwaitingMark.add(event.id());
                 }
 
                 @Override

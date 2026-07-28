@@ -32,7 +32,7 @@
  *       <td>{@link com.jrobertgardzinski.outbox.TransactionalOutbox#append}; the Spring adapter's
  *           {@code SpringOutbox.append} reaches the transaction-bound connection so the service
  *           cannot get this wrong by accident</td></tr>
- *   <tr><td>(b) delivered-first: {@code published} is set only after the broker CONFIRMED, never
+ *   <tr><td>(b) delivered-first: {@code published_at} is stamped only after the broker CONFIRMED, never
  *           after a flush or a buffered send</td>
  *       <td>LIBRARY (the mark) + SERVICE (an honest {@code confirmed()})</td>
  *       <td>{@link com.jrobertgardzinski.outbox.OutboxPublisher};
@@ -50,16 +50,32 @@
  *       <td>LIBRARY</td>
  *       <td>{@link com.jrobertgardzinski.outbox.TransactionalOutbox#deletePublishedOlderThan} and the
  *           order inside {@code runOnce}</td></tr>
- *   <tr><td>(f) the dials are range-checked, naming the property and echoing the value</td>
+ *   <tr><td>(f) an undeliverable event backs off instead of holding the head of the queue, and is
+ *           eventually left alone rather than retried for ever</td>
+ *       <td>LIBRARY</td>
+ *       <td>{@link com.jrobertgardzinski.outbox.TransactionalOutbox#recordFailedAttempt} and the
+ *           {@code attempts} / {@code next_attempt_at} columns. Added 2026-07-28: without them a
+ *           payload past the broker's message limit was retried every interval for ever AND, since
+ *           the poll is oldest-first, sat at the head of the batch — enough of those and no newer
+ *           event was ever selected again</td></tr>
+ *   <tr><td><strong>NOT guaranteed:</strong> a single relay. Two instances both poll and both send —
+ *           the poll has no {@code FOR UPDATE SKIP LOCKED} and no lease, deliberately, because
+ *           holding a database transaction across broker I/O is worse than a duplicate. Duplicates
+ *           scale with the instance count, so a deployment that runs more than one replica of a
+ *           service with an outbox must accept that, and a rolling update is itself a brief
+ *           two-instance window (hence {@code strategy: Recreate} on both deployments)</td>
+ *       <td>SERVICE — in its deployment</td>
+ *       <td>k8s/base/memes.yaml, k8s/base/comments.yaml</td></tr>
+ *   <tr><td>(g) the dials are range-checked, naming the property and echoing the value</td>
  *       <td>LIBRARY (the checks and the wording) + SERVICE (the property's name)</td>
  *       <td>{@link com.jrobertgardzinski.outbox.OutboxDials},
  *           {@link com.jrobertgardzinski.outbox.RepublisherSettings}</td></tr>
- *   <tr><td>(g) payload-width canary; the event id is the row id; the correlation id lives IN the row
+ *   <tr><td>(h) payload-width canary; the event id is the row id; the correlation id lives IN the row
  *           and is never read from a thread-local at send time</td>
  *       <td>LIBRARY (canary, id, stored cid) + SERVICE (embedding the id in its payload)</td>
  *       <td>{@link com.jrobertgardzinski.outbox.TransactionalOutbox#EXPECTED_MAX_PAYLOAD_CHARS},
  *           {@link com.jrobertgardzinski.outbox.OutboxEvent}</td></tr>
- *   <tr><td>(h) the producer's own clocks ({@code max.block.ms}, {@code delivery.timeout.ms},
+ *   <tr><td>(i) the producer's own clocks ({@code max.block.ms}, {@code delivery.timeout.ms},
  *           {@code request.timeout.ms}) are pinned explicitly and reconciled with the consumer's
  *           {@code max.poll.interval.ms}</td>
  *       <td>SERVICE — unavoidably</td>

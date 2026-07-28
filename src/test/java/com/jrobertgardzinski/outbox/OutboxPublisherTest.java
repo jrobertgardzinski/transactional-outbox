@@ -47,12 +47,21 @@ class OutboxPublisherTest {
     }
 
     @Test
-    @DisplayName("(b) a CONFIRMED first attempt marks the row — the happy path publishes exactly once")
+    @DisplayName("(b) a CONFIRMED first attempt marks the row — but on the DRAIN, never in the callback")
     void a_confirmed_send_marks_the_row() throws SQLException {
         publisher.publishWithoutWaiting(committed("e-1"));
 
         assertEquals(1, broker.sends());
-        assertTrue(database.published("e-1"));
+        // The mark used to happen right here, inside the confirmation callback — which is the Kafka
+        // producer's single I/O thread, and the mark is JDBC. A connection pool with nothing free
+        // blocks for Hikari's default thirty seconds, and that froze ALL of the service's Kafka
+        // sends: unrelated events hit their own delivery timeout and became more unpublished rows
+        // needing more marks. This assertion is the one that keeps the mark off that thread.
+        assertFalse(database.published("e-1"), "the producer's I/O thread must not touch the database");
+
+        assertEquals(1, publisher.drainConfirmations());
+
+        assertTrue(database.published("e-1"), "the republisher's pass writes the mark instead");
     }
 
     @Test
@@ -97,7 +106,12 @@ class OutboxPublisherTest {
 
         broker.settleAllConfirmed();   // the acknowledgement finally arrives, on the producer's thread
 
-        assertTrue(database.published("e-4"), "the completion callback must mark the row");
+        assertFalse(database.published("e-4"),
+                "the callback records the confirmation but does NOT write it — see the drain below");
+
+        publisher.drainConfirmations();
+
+        assertTrue(database.published("e-4"), "and the drain, on a thread allowed to block, marks it");
     }
 
     @Test
