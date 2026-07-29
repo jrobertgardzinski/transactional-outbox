@@ -1,0 +1,36 @@
+name: CI
+
+# The durability mechanism two services depend on, with a gate of its own.
+#
+# It had none until 2026-07-29, and the gap showed: the schema change of 2026-07-28 (published ->
+# published_at, plus the attempt counter and backoff) and the move of the mark off the Kafka
+# producer's I/O thread both landed with nothing but the aggregator's reactor watching — and that
+# reactor only runs when somebody pushes to the aggregator, which is a different repository. A
+# library whose whole promise is "this event WILL reach the broker" is the last place to accept
+# per-push feedback that arrives by accident.
+#
+# Self-contained: slf4j at compile time, H2 and a fake dispatch in tests. No broker, no database
+# to start, seconds to run.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+      # verify, not test: the dependency analysis runs later in the lifecycle, and an implicit
+      # compile-time dependency has already slipped past a green `mvn test` in this estate once
+      - name: Build and test
+        run: mvn -B --no-transfer-progress clean verify
