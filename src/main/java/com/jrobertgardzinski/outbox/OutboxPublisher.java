@@ -70,10 +70,17 @@ public final class OutboxPublisher {
                 outbox.markPublished(eventId);
                 marked++;
             } catch (RuntimeException markFailed) {
-                // delivered but unmarked: the republisher re-sends a duplicate later, which every
-                // consumer in this estate already has to absorb from at-least-once semantics
-                LOG.warn("event {} WAS delivered but could not be marked published — the republisher"
-                        + " may re-send a harmless duplicate", eventId, markFailed);
+                // The database is refusing writes, and the loop used to keep going — draining the
+                // whole queue against a database that was never going to answer, discarding every
+                // id on the way. Each one is a delivered event that the republisher then re-sends,
+                // so a moment of database trouble turned into a burst of duplicates proportional to
+                // whatever had accumulated. Put this one back and stop: the queue survives, the next
+                // pass tries again, and the cost of a failed drain is one pass rather than a batch.
+                confirmedAwaitingMark.add(eventId);
+                LOG.warn("event {} WAS delivered but could not be marked published — stopping this"
+                                + " drain; it and the rest of the queue wait for the next pass",
+                        eventId, markFailed);
+                break;
             }
         }
         return marked;
