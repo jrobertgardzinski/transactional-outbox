@@ -172,11 +172,17 @@ public final class OutboxPublisher {
                 }
             });
         } catch (RuntimeException sendRefused) {
-            // the producer refused it outright (closed, buffer full, serialisation) — about the
-            // event or about this instance, not about the broker's availability
+            // The producer refused it outright — and for Kafka that is what an OUTAGE looks like
+            // from the calling thread: send() blocks on the metadata fetch and on buffer space for
+            // up to max.block.ms and then throws TimeoutException synchronously, saying nothing
+            // about this event. Returning REJECTED here counted every such throw towards the
+            // poison ceiling, so a weekend-long outage under a restarted pod removed the row from
+            // the poll for ever through this very path. Nothing event-shaped is lost by the flat
+            // backoff: a String payload cannot fail serialisation, RecordTooLarge arrives through
+            // failed() below (still REJECTED), and "producer closed" is about this instance.
             LOG.error("event {} ({} for {}) could not be handed to the producer on re-send — it stays"
                     + " in the outbox", event.id(), event.type(), event.key(), sendRefused);
-            return Attempt.REJECTED;
+            return Attempt.TIMED_OUT;
         }
 
         Throwable failure;
@@ -190,6 +196,16 @@ public final class OutboxPublisher {
         } catch (Exception notConfirmed) {
             // TimeoutException or an ExecutionException from the outcome's own completion: either
             // way the broker did not say yes within the patience, so the row keeps its obligation.
+            // But a slow broker is not a dead one — its acknowledgement may still arrive AFTER the
+            // patience, and discarding it meant every subsequent pass re-sent an already-delivered
+            // event: one duplicate per pass for as long as the ack latency exceeded the patience.
+            // Accept the late confirmation the same way the first attempt does — through the queue,
+            // marked by a later drain — never by touching the database on the completing thread.
+            settled.thenAccept(lateOutcome -> {
+                if (lateOutcome == null) {
+                    confirmedAwaitingMark.add(event.id());
+                }
+            });
             LOG.error("event {} ({} for {}) was not confirmed by the broker within {} — it stays in"
                             + " the outbox, the next pass retries",
                     event.id(), event.type(), event.key(), patience, notConfirmed);

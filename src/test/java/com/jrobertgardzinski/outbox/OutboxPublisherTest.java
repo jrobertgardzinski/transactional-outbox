@@ -148,4 +148,44 @@ class OutboxPublisherTest {
 
         assertFalse(database.published("e-7"));
     }
+
+    @Test
+    @DisplayName("(d) a producer that THROWS on the re-send is a timeout, not a rejection — Kafka throws synchronously during an outage")
+    void the_waiting_attempt_treats_a_synchronous_throw_as_a_timeout() throws SQLException {
+        // KafkaProducer.send() blocks on the metadata fetch for up to max.block.ms and then throws
+        // TimeoutException SYNCHRONOUSLY — that is what a broker outage looks like from this thread.
+        // Counting it as REJECTED counted every outage pass towards poisonAfter, and 25 rounds is
+        // about eighteen hours: a weekend outage permanently removed the row from the poll.
+        broker.behave(FakeDispatch.Behaviour.THROW);
+
+        assertEquals(OutboxPublisher.Attempt.TIMED_OUT,
+                publisher.publishAndWait(committed("e-8"), Duration.ofSeconds(5)),
+                "a synchronous throw says nothing about the event — it must not count against it");
+
+        assertFalse(database.published("e-8"));
+    }
+
+    @Test
+    @DisplayName("(b)+(d) an acknowledgement arriving AFTER the patience is accepted through the drain — not discarded")
+    void a_late_acknowledgement_still_marks_the_row() throws SQLException {
+        // A slow broker is not a dead one. Discarding an ack that arrives after the patience left
+        // the row owed, so every subsequent pass re-sent an already-delivered event — one duplicate
+        // per pass for as long as the ack latency exceeded the patience.
+        broker.behave(FakeDispatch.Behaviour.SILENT);
+        OutboxEvent event = committed("e-9");
+
+        assertEquals(OutboxPublisher.Attempt.TIMED_OUT,
+                publisher.publishAndWait(event, Duration.ofMillis(50)));
+        assertFalse(database.published("e-9"), "no acknowledgement yet — nothing to mark");
+
+        broker.settleAllConfirmed();   // the acknowledgement arrives, late, on the producer's thread
+
+        assertFalse(database.published("e-9"),
+                "the late acknowledgement queues the mark but must NOT write it on that thread");
+
+        assertEquals(1, publisher.drainConfirmations(),
+                "the drain must find the late confirmation");
+        assertTrue(database.published("e-9"),
+                "a delivered event must be marked, however late the broker's word came");
+    }
 }

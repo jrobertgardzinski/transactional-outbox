@@ -168,6 +168,60 @@ class OutboxRepublisherTest {
     }
 
     @Test
+    @DisplayName("(d) a producer that THROWS synchronously never poisons a row — Kafka throws like that during an outage")
+    void a_throwing_producer_does_not_count_against_the_event() throws SQLException {
+        // The other face of an outage: KafkaProducer.send() does not always go silent — with no
+        // metadata in the cache (a pod restarted mid-outage) it throws TimeoutException
+        // SYNCHRONOUSLY after max.block.ms. That throw used to count as REJECTED, so attempts
+        // climbed on every pass and a weekend-long outage reached poisonAfter = 25, removing the
+        // row from the poll for ever — the exact defect the SILENT test above guards against,
+        // reachable through the synchronous path instead.
+        broker.behave(FakeDispatch.Behaviour.REJECT);
+        announce("outage-2", "stranded");
+        broker.behave(FakeDispatch.Behaviour.THROW);
+
+        for (int pass = 0; pass < 40; pass++) {          // far past poisonAfter = 25
+            clock.advance(Duration.ofMinutes(2));        // past any backoff this could have set
+            assertEquals(0, republisher.runOnce().poisoned(),
+                    "a synchronous throw must never poison — it says nothing about the event");
+        }
+
+        broker.behave(FakeDispatch.Behaviour.CONFIRM);
+        clock.advance(Duration.ofMinutes(2));
+        OutboxRepublisher.Pass recovery = republisher.runOnce();
+
+        assertEquals(1, recovery.resent(),
+                "after forty throwing passes the row must STILL be eligible — attempts must not"
+                        + " have grown towards the ceiling");
+        assertEquals(1, recovery.confirmed());
+        assertTrue(database.published("outage-2"), "and it goes out the moment the broker returns");
+    }
+
+    @Test
+    @DisplayName("(d) an acknowledgement arriving after the patience stops the duplicates — the next pass marks instead of re-sending")
+    void a_late_acknowledgement_prevents_the_re_send() throws SQLException {
+        // A broker whose ack latency exceeds the patience used to cause a duplicate on EVERY pass:
+        // the late ack was discarded, the row stayed owed, the next pass re-sent. The late ack must
+        // ride the same queue the first attempt uses, so the next pass marks the row and leaves it be.
+        broker.behave(FakeDispatch.Behaviour.REJECT);
+        announce("slow-1", "slow-broker");
+        broker.behave(FakeDispatch.Behaviour.SILENT);
+        clock.advance(Duration.ofMinutes(1));
+
+        assertEquals(new OutboxRepublisher.Pass(0, 0, 1, 0, 0), republisher.runOnce(),
+                "the re-send goes out and the patience elapses unanswered");
+        assertEquals(2, broker.sends());
+
+        broker.settleAllConfirmed();   // the broker answers — late, after the patience
+        clock.advance(Duration.ofMinutes(1));   // past the backoff the timed-out attempt bought
+
+        assertEquals(new OutboxRepublisher.Pass(1, 0, 0, 0, 0), republisher.runOnce(),
+                "the next pass must MARK the delivered row, not re-send it");
+        assertTrue(database.published("slow-1"));
+        assertEquals(2, broker.sends(), "delivered means done — no duplicate for the late ack");
+    }
+
+    @Test
     @DisplayName("(d) a broker that ANSWERS no still poisons the row — that part must not regress")
     void a_rejecting_broker_still_reaches_the_ceiling() throws SQLException {
         broker.behave(FakeDispatch.Behaviour.REJECT);
