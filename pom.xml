@@ -39,7 +39,7 @@
                  debugs a stuck outbox from, so they must reach the host's log configuration. -->
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>
-            <version>2.0.16</version>
+            <version>2.0.18</version>
         </dependency>
 
         <dependency>
@@ -67,7 +67,7 @@
             <!-- a binding for the tests only, so a failing run shows the library's own warnings -->
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-simple</artifactId>
-            <version>2.0.16</version>
+            <version>2.0.18</version>
             <scope>test</scope>
         </dependency>
     </dependencies>
